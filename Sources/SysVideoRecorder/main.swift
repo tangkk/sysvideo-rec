@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import CoreMedia
+import CoreGraphics
 import ScreenCaptureKit
 
 enum OutputFormat: String, CaseIterable {
@@ -159,7 +160,8 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate, AVCapt
         let config = SCStreamConfiguration()
         config.width = display.width; config.height = display.height
         config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        // BGRA is the most reliable uncompressed preview format on macOS 12.
+        config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = true
         let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
@@ -351,6 +353,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadDisplays() {
+        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
+            showError("请在“系统设置 → 隐私与安全性 → 屏幕录制”中允许终端，然后重新选择“屏幕”。")
+            return
+        }
         Task {
             do {
                 let content = try await SCShareableContent.current
