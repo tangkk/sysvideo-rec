@@ -2,6 +2,15 @@
 
 原生 macOS USB 摄像头录制小工具。运行 `./run.sh`，选择分辨率、麦克风和保存格式后开始录制。默认优先选择 USB 摄像头关联的麦克风，也可从下拉框切换输入。首次构建后，启动脚本会直接启动二进制程序，不会重复编译。
 
+从任意目录后台启动/停止：
+
+```bash
+/Users/tangkk/Projects/sysvideo-rec/scripts/start.sh
+/Users/tangkk/Projects/sysvideo-rec/scripts/stop.sh
+```
+
+两个脚本会自行解析仓库根路径，不依赖当前工作目录或 Home 下的可执行文件。
+
 首次启动时 macOS 会要求允许相机和麦克风权限；如被拒绝，请到“系统设置 → 隐私与安全性”中允许终端（或本程序）访问。
 
 支持 MP4/MOV 容器，以及 H.264/HEVC 编码。程序只做相机预览和实时硬件编码，不在内存中缓存整段视频，因此 CPU 和内存占用较低。
