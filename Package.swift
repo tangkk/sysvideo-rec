@@ -6,9 +6,6 @@ let package = Package(
     platforms: [.macOS(.v12)],
     products: [.executable(name: "sysvideo-rec", targets: ["SysVideoRecorder"])],
     targets: [
-        .executableTarget(
-            name: "SysVideoRecorder",
-            linkerSettings: [.linkedFramework("ScreenCaptureKit")]
-        )
+        .executableTarget(name: "SysVideoRecorder")
     ]
 )
