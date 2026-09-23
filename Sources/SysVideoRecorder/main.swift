@@ -267,7 +267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { do { let label = try await screen.startPreview(); await MainActor.run { self.resolution.removeAllItems(); self.resolution.addItem(withTitle: label); self.status.stringValue = "屏幕预览已就绪"; self.recordButton.isEnabled = true } } catch { await MainActor.run { self.showError("无法录制屏幕。请在“系统设置 → 隐私与安全性 → 屏幕录制”中允许终端访问。") } } }
         } else {
             screenPreview.flushAndRemoveImage(); screenPreview.isHidden = true; preview.isHidden = false
-            Task { await screenController?.stopPreview() }; screenController = nil
+            let oldScreenController = screenController
+            Task { await oldScreenController?.stopPreview() }; screenController = nil
             resolution.removeAllItems(); formats.forEach { resolution.addItem(withTitle: controller?.label(for: $0) ?? "") }; resolution.isEnabled = true
             controller?.session.startRunning(); recordButton.isEnabled = controller != nil; status.stringValue = "摄像头预览已就绪"
         }
@@ -280,7 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleRecording() {
-        guard controller != nil else { return }
+        guard isScreenMode ? screenController != nil : controller != nil else { return }
         if (isScreenMode ? screenController?.isRecording : controller?.isRecording) == true { finishRecording(); return }
         let format = OutputFormat.allCases[output.indexOfSelectedItem]
         let panel = NSSavePanel(); panel.title = "保存录制视频"; panel.nameFieldStringValue = "Camera-\(Self.timestamp()).\(format.extensionName)"; panel.allowedContentTypes = format.fileType == .mp4 ? [.mpeg4Movie] : [.quickTimeMovie]
@@ -292,13 +293,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func finishRecording() {
-        guard let controller else { return }
+        guard isScreenMode ? screenController != nil : controller != nil else { return }
         recordButton.isEnabled = false; status.stringValue = "正在写入文件…"
         let complete: (Result<Void, Error>) -> Void = { result in
             self.recordButton.isEnabled = true; self.recordButton.title = "开始录制"; self.source.isEnabled = true; self.resolution.isEnabled = !self.isScreenMode; self.output.isEnabled = true
             switch result { case .success: self.status.stringValue = "已保存：\(self.destination?.lastPathComponent ?? "视频")"; case .failure(let error): self.showError("保存失败：\(error.localizedDescription)") }
         }
-        if isScreenMode { screenController?.stopRecording(completion: complete) } else { controller.stopRecording(completion: complete) }
+        if isScreenMode { screenController?.stopRecording(completion: complete) } else { controller?.stopRecording(completion: complete) }
     }
 
     private func showError(_ message: String) { status.stringValue = message; NSSound.beep() }
