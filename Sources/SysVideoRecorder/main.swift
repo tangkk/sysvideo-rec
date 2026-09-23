@@ -3,18 +3,41 @@ import AVFoundation
 import CoreMedia
 
 final class BlackArrowPopUpButton: NSPopUpButton {
+    override init(frame frameRect: NSRect, pullsDown flag: Bool) {
+        super.init(frame: frameRect, pullsDown: flag)
+        focusRingType = .none
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        focusRingType = .none
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let arrowRect = NSRect(x: bounds.maxX - 24, y: bounds.midY - 9, width: 18, height: 18)
-        NSColor.controlBackgroundColor.setFill()
+
+        NSGraphicsContext.saveGraphicsState()
+        // Clipping to the button's own rounded shape means the black well
+        // below can never spill outside the visible bezel, however it's sized.
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 4, yRadius: 4).addClip()
+
+        let arrowRect = NSRect(x: bounds.maxX - 22, y: bounds.minY, width: 22, height: bounds.height)
+        NSColor.black.setFill()
         NSBezierPath(rect: arrowRect).fill()
-        NSColor.black.setStroke()
+
+        // NSPopUpButton draws with a flipped coordinate system, so the vertex
+        // needs the larger y value to point downward.
+        NSColor.white.setStroke()
         let arrow = NSBezierPath()
-        arrow.lineWidth = 1.5
-        arrow.move(to: NSPoint(x: arrowRect.minX + 5, y: arrowRect.midY + 2))
-        arrow.line(to: NSPoint(x: arrowRect.midX, y: arrowRect.midY - 3))
-        arrow.line(to: NSPoint(x: arrowRect.maxX - 5, y: arrowRect.midY + 2))
+        arrow.lineWidth = 1.3
+        arrow.lineCapStyle = .round
+        arrow.lineJoinStyle = .round
+        arrow.move(to: NSPoint(x: arrowRect.minX + 6, y: arrowRect.midY - 2.5))
+        arrow.line(to: NSPoint(x: arrowRect.midX, y: arrowRect.midY + 2.5))
+        arrow.line(to: NSPoint(x: arrowRect.maxX - 6, y: arrowRect.midY - 2.5))
         arrow.stroke()
+
+        NSGraphicsContext.restoreGraphicsState()
     }
 }
 
