@@ -2,6 +2,22 @@ import AppKit
 import AVFoundation
 import CoreMedia
 
+final class BlackArrowPopUpButton: NSPopUpButton {
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let arrowRect = NSRect(x: bounds.maxX - 24, y: bounds.midY - 9, width: 18, height: 18)
+        NSColor.controlBackgroundColor.setFill()
+        NSBezierPath(rect: arrowRect).fill()
+        NSColor.black.setStroke()
+        let arrow = NSBezierPath()
+        arrow.lineWidth = 1.5
+        arrow.move(to: NSPoint(x: arrowRect.minX + 5, y: arrowRect.midY + 2))
+        arrow.line(to: NSPoint(x: arrowRect.midX, y: arrowRect.midY - 3))
+        arrow.line(to: NSPoint(x: arrowRect.maxX - 5, y: arrowRect.midY + 2))
+        arrow.stroke()
+    }
+}
+
 enum OutputFormat: String, CaseIterable {
     case mp4H264 = "MP4 · H.264"
     case mp4HEVC = "MP4 · HEVC"
@@ -146,9 +162,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: CameraController?
     private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1_030, height: 610), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
     private let preview = AVCaptureVideoPreviewLayer()
-    private let microphone = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let resolution = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let output = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let microphone = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
+    private let resolution = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
+    private let output = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
     private let recordButton = NSButton(title: "Start recording", target: nil, action: nil)
     private let status = NSTextField(labelWithString: "Preparing…")
     private let playbackButton = NSButton(title: "▶ Play", target: nil, action: nil)
@@ -216,6 +232,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         microphone.widthAnchor.constraint(equalToConstant: 165).isActive = true
         resolution.widthAnchor.constraint(equalToConstant: 165).isActive = true
         output.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        microphone.contentTintColor = .black
+        resolution.contentTintColor = .black
+        output.contentTintColor = .black
         recordButton.bezelColor = NSColor(calibratedRed: 0.73, green: 0.11, blue: 0.11, alpha: 1)
         recordButton.contentTintColor = .white
         status.font = NSFont.systemFont(ofSize: 12, weight: .regular)
