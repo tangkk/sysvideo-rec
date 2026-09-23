@@ -21,6 +21,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
     private let device: AVCaptureDevice
+    private var microphoneInput: AVCaptureDeviceInput?
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
     private var audioWriterInput: AVAssetWriterInput?
@@ -71,12 +72,14 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         device.unlockForConfiguration()
     }
 
-    func enableMicrophone() {
-        guard let microphone = AVCaptureDevice.default(for: .audio),
-              let input = try? AVCaptureDeviceInput(device: microphone),
-              session.canAddInput(input), session.canAddOutput(audioOutput) else { return }
+    func setMicrophone(_ microphone: AVCaptureDevice) {
+        guard !isRecording, let input = try? AVCaptureDeviceInput(device: microphone) else { return }
         session.beginConfiguration()
+        if let microphoneInput { session.removeInput(microphoneInput) }
+        if session.outputs.contains(audioOutput) { session.removeOutput(audioOutput) }
+        guard session.canAddInput(input), session.canAddOutput(audioOutput) else { session.commitConfiguration(); return }
         session.addInput(input)
+        microphoneInput = input
         audioOutput.setSampleBufferDelegate(self, queue: queue)
         session.addOutput(audioOutput)
         session.commitConfiguration()
@@ -151,6 +154,7 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate, AVCapt
     private var audioWriterInput: AVAssetWriterInput?
     private let microphoneSession = AVCaptureSession()
     private let microphoneOutput = AVCaptureAudioDataOutput()
+    private var microphoneInput: AVCaptureDeviceInput?
     private var startedAt: CMTime?
     private(set) var isRecording = false
     var onFrame: ((CMSampleBuffer) -> Void)?
@@ -170,12 +174,14 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate, AVCapt
         return "屏幕：\(display.width) × \(display.height)"
     }
 
-    func enableMicrophone() {
-        guard let microphone = AVCaptureDevice.default(for: .audio),
-              let input = try? AVCaptureDeviceInput(device: microphone),
-              microphoneSession.canAddInput(input), microphoneSession.canAddOutput(microphoneOutput) else { return }
+    func setMicrophone(_ microphone: AVCaptureDevice) {
+        guard !isRecording, let input = try? AVCaptureDeviceInput(device: microphone) else { return }
         microphoneSession.beginConfiguration()
+        if let microphoneInput { microphoneSession.removeInput(microphoneInput) }
+        if microphoneSession.outputs.contains(microphoneOutput) { microphoneSession.removeOutput(microphoneOutput) }
+        guard microphoneSession.canAddInput(input), microphoneSession.canAddOutput(microphoneOutput) else { microphoneSession.commitConfiguration(); return }
         microphoneSession.addInput(input)
+        microphoneInput = input
         microphoneOutput.setSampleBufferDelegate(self, queue: queue)
         microphoneSession.addOutput(microphoneOutput)
         microphoneSession.commitConfiguration()
@@ -241,16 +247,18 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate, AVCapt
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: CameraController?
     private var screenController: ScreenController?
-    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 610), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1_030, height: 610), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
     private let preview = AVCaptureVideoPreviewLayer()
     private let screenPreview = AVSampleBufferDisplayLayer()
     private let source = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let microphone = NSPopUpButton(frame: .zero, pullsDown: false)
     private let resolution = NSPopUpButton(frame: .zero, pullsDown: false)
     private let output = NSPopUpButton(frame: .zero, pullsDown: false)
     private let recordButton = NSButton(title: "开始录制", target: nil, action: nil)
     private let status = NSTextField(labelWithString: "准备中…")
     private var formats: [AVCaptureDevice.Format] = []
     private var displays: [SCDisplay] = []
+    private var microphones: [AVCaptureDevice] = []
     private var destination: URL?
     private var isScreenMode: Bool { source.indexOfSelectedItem == 1 }
 
@@ -268,14 +276,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let root = NSView(frame: window.contentView!.bounds); root.autoresizingMask = [.width, .height]
         window.contentView = root
         preview.videoGravity = .resizeAspect
-        preview.frame = NSRect(x: 16, y: 82, width: 828, height: 512); preview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        preview.frame = NSRect(x: 16, y: 82, width: 998, height: 512); preview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         screenPreview.frame = preview.frame; screenPreview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]; screenPreview.videoGravity = .resizeAspect; screenPreview.isHidden = true
         root.layer = CALayer(); root.wantsLayer = true; root.layer?.backgroundColor = NSColor.black.cgColor
         root.layer?.addSublayer(preview); root.layer?.addSublayer(screenPreview)
-        let bar = NSStackView(views: [NSTextField(labelWithString: "来源"), source, NSTextField(labelWithString: "分辨率"), resolution, NSTextField(labelWithString: "保存格式"), output, recordButton, status])
+        let bar = NSStackView(views: [NSTextField(labelWithString: "来源"), source, NSTextField(labelWithString: "麦克风"), microphone, NSTextField(labelWithString: "分辨率"), resolution, NSTextField(labelWithString: "保存格式"), output, recordButton, status])
         bar.orientation = .horizontal; bar.spacing = 10; bar.alignment = .centerY
-        bar.frame = NSRect(x: 16, y: 18, width: 828, height: 40); bar.autoresizingMask = [.width, .maxYMargin]
+        bar.frame = NSRect(x: 16, y: 18, width: 998, height: 40); bar.autoresizingMask = [.width, .maxYMargin]
         source.widthAnchor.constraint(equalToConstant: 85).isActive = true
+        microphone.widthAnchor.constraint(equalToConstant: 165).isActive = true
         resolution.widthAnchor.constraint(equalToConstant: 165).isActive = true
         output.widthAnchor.constraint(equalToConstant: 130).isActive = true
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -283,6 +292,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         OutputFormat.allCases.forEach { output.addItem(withTitle: $0.rawValue) }
         source.addItems(withTitles: ["摄像头", "屏幕"])
         source.target = self; source.action = #selector(changeSource)
+        microphone.target = self; microphone.action = #selector(changeMicrophone)
+        microphone.isEnabled = false
         resolution.target = self; resolution.action = #selector(changeResolution)
         recordButton.target = self; recordButton.action = #selector(toggleRecording)
         recordButton.isEnabled = false
@@ -302,7 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let devices = AVCaptureDevice.DiscoverySession(deviceTypes: [.externalUnknown, .builtInWideAngleCamera], mediaType: .video, position: .unspecified).devices
         guard let device = devices.first, let controller = CameraController(device: device) else { showError("未找到可用摄像头。"); return }
         self.controller = controller; preview.session = controller.session
-        requestMicrophone(for: controller)
+        loadMicrophones(prefer: device)
         formats = controller.availableFormats()
         formats.forEach { resolution.addItem(withTitle: controller.label(for: $0)) }
         if let index = formats.firstIndex(where: { let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription); return d.width == 1920 && d.height == 1080 }) { resolution.selectItem(at: index); try? controller.select(formats[index]) }
@@ -310,18 +321,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordButton.isEnabled = true; status.stringValue = "已连接：\(device.localizedName)"
     }
 
+    private func loadMicrophones(prefer camera: AVCaptureDevice? = nil) {
+        microphones = AVCaptureDevice.devices(for: .audio)
+        microphone.removeAllItems()
+        microphones.forEach { microphone.addItem(withTitle: $0.localizedName) }
+        guard !microphones.isEmpty else { microphone.addItem(withTitle: "未找到麦克风"); return }
+        let preferred = microphones.firstIndex { candidate in
+            guard let camera else { return false }
+            let name = candidate.localizedName.lowercased()
+            let cameraName = camera.localizedName.lowercased()
+            return name.contains(cameraName) || cameraName.contains(name) || name.contains("webcam") || name.contains("usb") || name.contains("external")
+        } ?? 0
+        microphone.selectItem(at: preferred); microphone.isEnabled = true
+        applyMicrophone()
+    }
+
+    private func applyMicrophone() {
+        guard microphones.indices.contains(microphone.indexOfSelectedItem) else { return }
+        let selected = microphones[microphone.indexOfSelectedItem]
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: configureMicrophone(selected)
+        case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { self.configureMicrophone(selected) } } }
+        default: status.stringValue = "未授权麦克风"
+        }
+    }
+
+    private func configureMicrophone(_ selected: AVCaptureDevice) {
+        if isScreenMode { screenController?.setMicrophone(selected) } else { controller?.setMicrophone(selected) }
+        status.stringValue = "麦克风：\(selected.localizedName)"
+    }
+
+    @objc private func changeMicrophone() { applyMicrophone() }
+
     private func requestMicrophone(for controller: CameraController) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: controller.enableMicrophone()
-        case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { controller.enableMicrophone() } } }
+        case .authorized: if microphones.indices.contains(microphone.indexOfSelectedItem) { controller.setMicrophone(microphones[microphone.indexOfSelectedItem]) }
+        case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { self.applyMicrophone() } } }
         default: status.stringValue = "摄像头预览已就绪（未授权麦克风）"
         }
     }
 
     private func requestMicrophone(for controller: ScreenController) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: controller.enableMicrophone()
-        case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { controller.enableMicrophone() } } }
+        case .authorized: if microphones.indices.contains(microphone.indexOfSelectedItem) { controller.setMicrophone(microphones[microphone.indexOfSelectedItem]) }
+        case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { self.applyMicrophone() } } }
         default: status.stringValue = "屏幕预览已就绪（未授权麦克风）"
         }
     }
@@ -398,7 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panel = NSSavePanel(); panel.title = "保存录制视频"; panel.nameFieldStringValue = "Camera-\(Self.timestamp()).\(format.extensionName)"; panel.allowedContentTypes = format.fileType == .mp4 ? [.mpeg4Movie] : [.quickTimeMovie]
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
-            do { if self.isScreenMode { try self.screenController?.startRecording(to: url, format: format) } else { try self.controller?.startRecording(to: url, format: format) }; self.destination = url; self.recordButton.title = "停止并保存"; self.source.isEnabled = false; self.resolution.isEnabled = false; self.output.isEnabled = false; self.status.stringValue = "正在录制" }
+            do { if self.isScreenMode { try self.screenController?.startRecording(to: url, format: format) } else { try self.controller?.startRecording(to: url, format: format) }; self.destination = url; self.recordButton.title = "停止并保存"; self.source.isEnabled = false; self.microphone.isEnabled = false; self.resolution.isEnabled = false; self.output.isEnabled = false; self.status.stringValue = "正在录制" }
             catch { self.showError("无法开始录制：\(error.localizedDescription)") }
         }
     }
@@ -407,7 +450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard isScreenMode ? screenController != nil : controller != nil else { return }
         recordButton.isEnabled = false; status.stringValue = "正在写入文件…"
         let complete: (Result<Void, Error>) -> Void = { result in
-            self.recordButton.isEnabled = true; self.recordButton.title = "开始录制"; self.source.isEnabled = true; self.resolution.isEnabled = !self.isScreenMode; self.output.isEnabled = true
+            self.recordButton.isEnabled = true; self.recordButton.title = "开始录制"; self.source.isEnabled = true; self.microphone.isEnabled = !self.microphones.isEmpty; self.resolution.isEnabled = !self.isScreenMode; self.output.isEnabled = true
             switch result { case .success: self.status.stringValue = "已保存：\(self.destination?.lastPathComponent ?? "视频")"; case .failure(let error): self.showError("保存失败：\(error.localizedDescription)") }
         }
         if isScreenMode { screenController?.stopRecording(completion: complete) } else { controller?.stopRecording(completion: complete) }
