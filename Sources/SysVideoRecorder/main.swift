@@ -262,7 +262,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isScreenMode {
             controller?.session.stopRunning(); preview.isHidden = true; screenPreview.isHidden = false
             resolution.removeAllItems(); resolution.addItem(withTitle: "连接屏幕中…"); resolution.isEnabled = false; recordButton.isEnabled = false
-            guard #available(macOS 12.3, *) else { showError("录屏需要 macOS 12.3 或更高版本。"); return }
             let screen = ScreenController(); screen.onFrame = { [weak self] sample in self?.screenPreview.enqueue(sample) }; screenController = screen
             Task { do { let label = try await screen.startPreview(); await MainActor.run { self.resolution.removeAllItems(); self.resolution.addItem(withTitle: label); self.status.stringValue = "屏幕预览已就绪"; self.recordButton.isEnabled = true } } catch { await MainActor.run { self.showError("无法录制屏幕。请在“系统设置 → 隐私与安全性 → 屏幕录制”中允许终端访问。") } } }
         } else {
