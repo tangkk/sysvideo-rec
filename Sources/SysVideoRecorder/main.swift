@@ -58,7 +58,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     func label(for format: AVCaptureDevice.Format) -> String {
         let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         let fps = format.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 30
-        return "\(d.width) × \(d.height)  (最高 \(Int(fps.rounded())) fps)"
+        return "\(d.width) × \(d.height)  (up to \(Int(fps.rounded())) fps)"
     }
 
     func select(_ format: AVCaptureDevice.Format) throws {
@@ -140,7 +140,7 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     }
 }
 
-enum RecorderError: LocalizedError { case writerSetup; var errorDescription: String? { "无法创建视频编码器。" } }
+enum RecorderError: LocalizedError { case writerSetup; var errorDescription: String? { "Unable to create the video encoder." } }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: CameraController?
@@ -149,11 +149,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let microphone = NSPopUpButton(frame: .zero, pullsDown: false)
     private let resolution = NSPopUpButton(frame: .zero, pullsDown: false)
     private let output = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let recordButton = NSButton(title: "开始录制", target: nil, action: nil)
-    private let status = NSTextField(labelWithString: "准备中…")
+    private let recordButton = NSButton(title: "Start recording", target: nil, action: nil)
+    private let status = NSTextField(labelWithString: "Preparing…")
+    private let playbackButton = NSButton(title: "▶ Play", target: nil, action: nil)
+    private let playbackSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let playbackTime = NSTextField(labelWithString: "00:00 / 00:00")
     private var formats: [AVCaptureDevice.Format] = []
     private var microphones: [AVCaptureDevice] = []
     private var destination: URL?
+    private weak var stage: NSView?
+    private var player: AVPlayer?
+    private var playerLayer: AVPlayerLayer?
+    private var playbackTimer: Timer?
+    private var playbackBar: NSStackView?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -164,22 +172,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     private func buildUI() {
-        window.title = "视频录制"
+        window.title = "sysvideo-rec · Web Media Inspector"
         window.center()
-        let root = NSView(frame: window.contentView!.bounds); root.autoresizingMask = [.width, .height]
+        let root = NSView(frame: window.contentView!.bounds)
+        root.autoresizingMask = [.width, .height]
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor(calibratedRed: 0.965, green: 0.965, blue: 0.945, alpha: 1).cgColor
         window.contentView = root
+
+        let stage = NSView(frame: NSRect(x: 16, y: 154, width: 998, height: 440))
+        stage.autoresizingMask = [.width, .height]
+        stage.wantsLayer = true
+        stage.layer?.backgroundColor = NSColor(calibratedWhite: 0.055, alpha: 1).cgColor
+        stage.layer?.cornerRadius = 16
+        stage.layer?.masksToBounds = true
+        stage.layer?.borderWidth = 1
+        stage.layer?.borderColor = NSColor(calibratedWhite: 0.15, alpha: 1).cgColor
+        root.addSubview(stage)
+        self.stage = stage
         preview.videoGravity = .resizeAspect
-        preview.frame = NSRect(x: 16, y: 82, width: 998, height: 512); preview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        root.layer = CALayer(); root.wantsLayer = true; root.layer?.backgroundColor = NSColor.black.cgColor
-        root.layer?.addSublayer(preview)
-        let bar = NSStackView(views: [NSTextField(labelWithString: "麦克风"), microphone, NSTextField(labelWithString: "分辨率"), resolution, NSTextField(labelWithString: "保存格式"), output, recordButton, status])
-        bar.orientation = .horizontal; bar.spacing = 10; bar.alignment = .centerY
-        bar.frame = NSRect(x: 16, y: 18, width: 998, height: 40); bar.autoresizingMask = [.width, .maxYMargin]
+        preview.frame = stage.bounds
+        preview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        stage.layer?.addSublayer(preview)
+
+        func fieldLabel(_ title: String) -> NSTextField {
+            let label = NSTextField(labelWithString: title.uppercased())
+            label.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+            label.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
+            return label
+        }
+        let bar = NSStackView(views: [fieldLabel("Microphone"), microphone, fieldLabel("Resolution"), resolution, fieldLabel("Format"), output, recordButton, status])
+        bar.orientation = .horizontal
+        bar.spacing = 10
+        bar.alignment = .centerY
+        bar.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        bar.frame = NSRect(x: 16, y: 82, width: 998, height: 58)
+        bar.autoresizingMask = [.width, .maxYMargin]
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = NSColor.white.cgColor
+        bar.layer?.cornerRadius = 12
+        bar.layer?.borderWidth = 1
+        bar.layer?.borderColor = NSColor(calibratedWhite: 0.86, alpha: 1).cgColor
         microphone.widthAnchor.constraint(equalToConstant: 165).isActive = true
         resolution.widthAnchor.constraint(equalToConstant: 165).isActive = true
         output.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        recordButton.bezelColor = NSColor(calibratedRed: 0.73, green: 0.11, blue: 0.11, alpha: 1)
+        recordButton.contentTintColor = .white
+        status.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        status.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         root.addSubview(bar)
+
+        let playback = NSStackView(views: [fieldLabel("Playback"), playbackButton, playbackSlider, playbackTime])
+        playback.orientation = .horizontal
+        playback.spacing = 10
+        playback.alignment = .centerY
+        playback.edgeInsets = NSEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
+        playback.frame = NSRect(x: 16, y: 18, width: 998, height: 46)
+        playback.autoresizingMask = [.width, .maxYMargin]
+        playback.wantsLayer = true
+        playback.layer?.backgroundColor = NSColor.white.cgColor
+        playback.layer?.cornerRadius = 12
+        playback.layer?.borderWidth = 1
+        playback.layer?.borderColor = NSColor(calibratedWhite: 0.86, alpha: 1).cgColor
+        playback.isHidden = true
+        playbackSlider.translatesAutoresizingMaskIntoConstraints = false
+        playbackSlider.widthAnchor.constraint(equalToConstant: 500).isActive = true
+        playbackTime.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        playbackTime.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
+        playbackButton.target = self
+        playbackButton.action = #selector(togglePlayback)
+        playbackSlider.target = self
+        playbackSlider.action = #selector(seekPlayback)
+        playbackSlider.isContinuous = true
+        root.addSubview(playback)
+        playbackBar = playback
         OutputFormat.allCases.forEach { output.addItem(withTitle: $0.rawValue) }
         microphone.target = self; microphone.action = #selector(changeMicrophone)
         microphone.isEnabled = false
@@ -193,28 +260,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: setupCamera()
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { granted in DispatchQueue.main.async { granted ? self.setupCamera() : self.showError("请在“系统设置 → 隐私与安全性 → 相机”中允许访问相机。") } }
-        default: showError("没有相机访问权限。请在“系统设置 → 隐私与安全性 → 相机”中允许访问相机。")
+            AVCaptureDevice.requestAccess(for: .video) { granted in DispatchQueue.main.async { granted ? self.setupCamera() : self.showError("Allow camera access in System Settings → Privacy & Security → Camera.") } }
+        default: showError("Camera access is not allowed. Enable it in System Settings → Privacy & Security → Camera.")
         }
     }
 
     private func setupCamera() {
         let devices = AVCaptureDevice.DiscoverySession(deviceTypes: [.externalUnknown, .builtInWideAngleCamera], mediaType: .video, position: .unspecified).devices
-        guard let device = devices.first, let controller = CameraController(device: device) else { showError("未找到可用摄像头。"); return }
+        guard let device = devices.first, let controller = CameraController(device: device) else { showError("No camera was found."); return }
         self.controller = controller; preview.session = controller.session
         loadMicrophones(prefer: device)
         formats = controller.availableFormats()
         formats.forEach { resolution.addItem(withTitle: controller.label(for: $0)) }
         if let index = formats.firstIndex(where: { let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription); return d.width == 1920 && d.height == 1080 }) { resolution.selectItem(at: index); try? controller.select(formats[index]) }
         controller.session.startRunning()
-        recordButton.isEnabled = true; status.stringValue = "已连接：\(device.localizedName)"
+        recordButton.isEnabled = true; status.stringValue = "Connected: \(device.localizedName)"
     }
 
     private func loadMicrophones(prefer camera: AVCaptureDevice? = nil) {
         microphones = AVCaptureDevice.devices(for: .audio)
         microphone.removeAllItems()
         microphones.forEach { microphone.addItem(withTitle: $0.localizedName) }
-        guard !microphones.isEmpty else { microphone.addItem(withTitle: "未找到麦克风"); return }
+        guard !microphones.isEmpty else { microphone.addItem(withTitle: "No microphone found"); return }
         let preferred = microphones.firstIndex { candidate in
             guard let camera else { return false }
             let name = candidate.localizedName.lowercased()
@@ -231,43 +298,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: configureMicrophone(selected)
         case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { self.configureMicrophone(selected) } } }
-        default: status.stringValue = "未授权麦克风"
+        default: status.stringValue = "Microphone access is not allowed"
         }
     }
 
     private func configureMicrophone(_ selected: AVCaptureDevice) {
         controller?.setMicrophone(selected)
-        status.stringValue = "麦克风：\(selected.localizedName)"
+        status.stringValue = "Microphone: \(selected.localizedName)"
     }
 
     @objc private func changeMicrophone() { applyMicrophone() }
 
     @objc private func changeResolution() {
         guard let controller, resolution.indexOfSelectedItem >= 0 else { return }
-        do { try controller.select(formats[resolution.indexOfSelectedItem]); status.stringValue = "分辨率已切换" }
-        catch { showError("切换分辨率失败：\(error.localizedDescription)") }
+        do { try controller.select(formats[resolution.indexOfSelectedItem]); status.stringValue = "Resolution updated" }
+        catch { showError("Could not change resolution: \(error.localizedDescription)") }
     }
 
     @objc private func toggleRecording() {
         guard let controller else { return }
         if controller.isRecording { finishRecording(); return }
+        clearPlayback()
         let format = OutputFormat.allCases[output.indexOfSelectedItem]
-        let panel = NSSavePanel(); panel.title = "保存录制视频"; panel.nameFieldStringValue = "Camera-\(Self.timestamp()).\(format.extensionName)"; panel.allowedContentTypes = format.fileType == .mp4 ? [.mpeg4Movie] : [.quickTimeMovie]
+        let panel = NSSavePanel(); panel.title = "Save recorded video"; panel.nameFieldStringValue = "Camera-\(Self.timestamp()).\(format.extensionName)"; panel.allowedContentTypes = format.fileType == .mp4 ? [.mpeg4Movie] : [.quickTimeMovie]
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
-            do { try self.controller?.startRecording(to: url, format: format); self.destination = url; self.recordButton.title = "停止并保存"; self.microphone.isEnabled = false; self.resolution.isEnabled = false; self.output.isEnabled = false; self.status.stringValue = "正在录制" }
-            catch { self.showError("无法开始录制：\(error.localizedDescription)") }
+            do { try self.controller?.startRecording(to: url, format: format); self.destination = url; self.recordButton.title = "Stop and save"; self.microphone.isEnabled = false; self.resolution.isEnabled = false; self.output.isEnabled = false; self.status.stringValue = "Recording" }
+            catch { self.showError("Could not start recording: \(error.localizedDescription)") }
         }
     }
 
     private func finishRecording() {
         guard let controller else { return }
-        recordButton.isEnabled = false; status.stringValue = "正在写入文件…"
+        recordButton.isEnabled = false; status.stringValue = "Writing file…"
         let complete: (Result<Void, Error>) -> Void = { result in
-            self.recordButton.isEnabled = true; self.recordButton.title = "开始录制"; self.microphone.isEnabled = !self.microphones.isEmpty; self.resolution.isEnabled = true; self.output.isEnabled = true
-            switch result { case .success: self.status.stringValue = "已保存：\(self.destination?.lastPathComponent ?? "视频")"; case .failure(let error): self.showError("保存失败：\(error.localizedDescription)") }
+            self.recordButton.isEnabled = true; self.recordButton.title = "Start recording"; self.microphone.isEnabled = !self.microphones.isEmpty; self.resolution.isEnabled = true; self.output.isEnabled = true
+            switch result {
+            case .success:
+                self.status.stringValue = "Saved: \(self.destination?.lastPathComponent ?? "video")"
+                if let destination = self.destination { self.preparePlayback(url: destination) }
+            case .failure(let error):
+                self.showError("Could not save: \(error.localizedDescription)")
+            }
         }
         controller.stopRecording(completion: complete)
+    }
+
+    private func preparePlayback(url: URL) {
+        clearPlayback()
+        let newPlayer = AVPlayer(url: url)
+        player = newPlayer
+        let layer = AVPlayerLayer(player: newPlayer)
+        layer.videoGravity = .resizeAspect
+        layer.frame = stage?.bounds ?? .zero
+        layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        stage?.layer?.addSublayer(layer)
+        playerLayer = layer
+        preview.isHidden = true
+        playbackBar?.isHidden = false
+        let newTimer = Timer(timeInterval: 0.1, target: self, selector: #selector(updatePlaybackUI), userInfo: nil, repeats: true)
+        RunLoop.main.add(newTimer, forMode: .common)
+        playbackTimer = newTimer
+        updatePlaybackUI()
+    }
+
+    private func clearPlayback() {
+        player?.pause()
+        player = nil
+        playerLayer?.removeFromSuperlayer()
+        playerLayer = nil
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+        preview.isHidden = false
+        playbackBar?.isHidden = true
+        playbackButton.title = "▶ Play"
+        playbackSlider.doubleValue = 0
+        playbackTime.stringValue = "00:00 / 00:00"
+    }
+
+    @objc private func togglePlayback() {
+        guard let player else { return }
+        let duration = player.currentItem?.duration.seconds ?? 0
+        if player.rate == 0 {
+            if duration.isFinite, player.currentTime().seconds >= duration - 0.05 { player.seek(to: .zero) }
+            player.play()
+            playbackButton.title = "❚❚ Pause"
+        } else {
+            player.pause()
+            playbackButton.title = "▶ Play"
+        }
+    }
+
+    @objc private func seekPlayback() {
+        guard let player else { return }
+        player.seek(to: CMTime(seconds: playbackSlider.doubleValue, preferredTimescale: 600))
+        updatePlaybackUI()
+    }
+
+    @objc private func updatePlaybackUI() {
+        guard let player else { return }
+        let current = max(0, player.currentTime().seconds)
+        let duration = player.currentItem?.duration.seconds ?? 0
+        guard duration.isFinite, duration > 0 else { return }
+        playbackSlider.maxValue = duration
+        playbackSlider.doubleValue = min(current, duration)
+        playbackTime.stringValue = "\(Self.playbackTime(current)) / \(Self.playbackTime(duration))"
+        if current >= duration - 0.05, player.rate == 0 { playbackButton.title = "▶ Play" }
+    }
+
+    private static func playbackTime(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        return String(format: "%02d:%02d", total / 60, total % 60)
     }
 
     private func showError(_ message: String) { status.stringValue = message; NSSound.beep() }
