@@ -14,13 +14,15 @@ enum OutputFormat: String, CaseIterable {
     var extensionName: String { fileType == .mp4 ? "mp4" : "mov" }
 }
 
-final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     let queue = DispatchQueue(label: "camera.capture", qos: .userInitiated)
     let videoOutput = AVCaptureVideoDataOutput()
+    private let audioOutput = AVCaptureAudioDataOutput()
     private let device: AVCaptureDevice
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
+    private var audioWriterInput: AVAssetWriterInput?
     private var startedAt: CMTime?
     private(set) var isRecording = false
 
@@ -68,6 +70,17 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         device.unlockForConfiguration()
     }
 
+    func enableMicrophone() {
+        guard let microphone = AVCaptureDevice.default(for: .audio),
+              let input = try? AVCaptureDeviceInput(device: microphone),
+              session.canAddInput(input), session.canAddOutput(audioOutput) else { return }
+        session.beginConfiguration()
+        session.addInput(input)
+        audioOutput.setSampleBufferDelegate(self, queue: queue)
+        session.addOutput(audioOutput)
+        session.commitConfiguration()
+    }
+
     func startRecording(to url: URL, format: OutputFormat) throws {
         guard !isRecording else { return }
         let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
@@ -84,6 +97,10 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         writerInput?.expectsMediaDataInRealTime = true
         guard let writer, let writerInput, writer.canAdd(writerInput) else { throw RecorderError.writerSetup }
         writer.add(writerInput)
+        let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128_000]
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        audioInput.expectsMediaDataInRealTime = true
+        if session.inputs.contains(where: { ($0 as? AVCaptureDeviceInput)?.device.hasMediaType(.audio) == true }) && writer.canAdd(audioInput) { writer.add(audioInput); audioWriterInput = audioInput }
         startedAt = nil
         isRecording = true
     }
@@ -94,16 +111,23 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             self.isRecording = false
             guard let writer = self.writer, let input = self.writerInput else { completion(.failure(RecorderError.writerSetup)); return }
             input.markAsFinished()
+            self.audioWriterInput?.markAsFinished()
             writer.finishWriting {
                 let result: Result<Void, Error> = writer.status == .completed ? .success(()) : .failure(writer.error ?? RecorderError.writerSetup)
-                self.writer = nil; self.writerInput = nil; self.startedAt = nil
+                self.writer = nil; self.writerInput = nil; self.audioWriterInput = nil; self.startedAt = nil
                 DispatchQueue.main.async { completion(result) }
             }
         }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard isRecording, let writer, let input = writerInput else { return }
+        guard isRecording, let writer else { return }
+        if output === audioOutput {
+            guard startedAt != nil, let input = audioWriterInput else { return }
+            if input.isReadyForMoreMediaData { input.append(sampleBuffer) }
+            return
+        }
+        guard let input = writerInput else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if startedAt == nil {
             guard writer.startWriting() else { isRecording = false; return }
@@ -117,19 +141,20 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
 enum RecorderError: LocalizedError { case writerSetup; var errorDescription: String? { "无法创建视频编码器。" } }
 
 @available(macOS 12.3, *)
-final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate {
+final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     let queue = DispatchQueue(label: "screen.capture", qos: .userInitiated)
     private var stream: SCStream?
     private var size = CGSize.zero
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
+    private var audioWriterInput: AVAssetWriterInput?
+    private let microphoneSession = AVCaptureSession()
+    private let microphoneOutput = AVCaptureAudioDataOutput()
     private var startedAt: CMTime?
     private(set) var isRecording = false
     var onFrame: ((CMSampleBuffer) -> Void)?
 
-    func startPreview() async throws -> String {
-        let content = try await SCShareableContent.current
-        guard let display = content.displays.first else { throw RecorderError.writerSetup }
+    func startPreview(display: SCDisplay) async throws -> String {
         size = CGSize(width: display.width, height: display.height)
         let config = SCStreamConfiguration()
         config.width = display.width; config.height = display.height
@@ -143,10 +168,23 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate {
         return "屏幕：\(display.width) × \(display.height)"
     }
 
+    func enableMicrophone() {
+        guard let microphone = AVCaptureDevice.default(for: .audio),
+              let input = try? AVCaptureDeviceInput(device: microphone),
+              microphoneSession.canAddInput(input), microphoneSession.canAddOutput(microphoneOutput) else { return }
+        microphoneSession.beginConfiguration()
+        microphoneSession.addInput(input)
+        microphoneOutput.setSampleBufferDelegate(self, queue: queue)
+        microphoneSession.addOutput(microphoneOutput)
+        microphoneSession.commitConfiguration()
+        microphoneSession.startRunning()
+    }
+
     func stopPreview() async {
         guard let stream else { return }
         try? await stream.stopCapture()
         self.stream = nil
+        microphoneSession.stopRunning()
     }
 
     func startRecording(to url: URL, format: OutputFormat) throws {
@@ -158,6 +196,10 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate {
         writerInput?.expectsMediaDataInRealTime = true
         guard let writer, let input = writerInput, writer.canAdd(input) else { throw RecorderError.writerSetup }
         writer.add(input); startedAt = nil; isRecording = true
+        let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128_000]
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        audioInput.expectsMediaDataInRealTime = true
+        if writer.canAdd(audioInput) { writer.add(audioInput); audioWriterInput = audioInput }
     }
 
     func stopRecording(completion: @escaping (Result<Void, Error>) -> Void) {
@@ -166,16 +208,18 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate {
             self.isRecording = false
             guard let writer = self.writer, let input = self.writerInput else { completion(.failure(RecorderError.writerSetup)); return }
             input.markAsFinished()
+            self.audioWriterInput?.markAsFinished()
             writer.finishWriting {
                 let result: Result<Void, Error> = writer.status == .completed ? .success(()) : .failure(writer.error ?? RecorderError.writerSetup)
-                self.writer = nil; self.writerInput = nil; self.startedAt = nil
+                self.writer = nil; self.writerInput = nil; self.audioWriterInput = nil; self.startedAt = nil
                 DispatchQueue.main.async { completion(result) }
             }
         }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-        guard outputType == .screen, sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        guard outputType == .screen else { return }
         DispatchQueue.main.async { self.onFrame?(sampleBuffer) }
         guard isRecording, let writer, let input = writerInput else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -184,6 +228,11 @@ final class ScreenController: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) { isRecording = false }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard isRecording, startedAt != nil, let input = audioWriterInput, input.isReadyForMoreMediaData else { return }
+        input.append(sampleBuffer)
+    }
 }
 
 @available(macOS 12.3, *)
@@ -199,6 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let recordButton = NSButton(title: "开始录制", target: nil, action: nil)
     private let status = NSTextField(labelWithString: "准备中…")
     private var formats: [AVCaptureDevice.Format] = []
+    private var displays: [SCDisplay] = []
     private var destination: URL?
     private var isScreenMode: Bool { source.indexOfSelectedItem == 1 }
 
@@ -250,6 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let devices = AVCaptureDevice.DiscoverySession(deviceTypes: [.externalUnknown, .builtInWideAngleCamera], mediaType: .video, position: .unspecified).devices
         guard let device = devices.first, let controller = CameraController(device: device) else { showError("未找到可用摄像头。"); return }
         self.controller = controller; preview.session = controller.session
+        requestMicrophone(for: controller)
         formats = controller.availableFormats()
         formats.forEach { resolution.addItem(withTitle: controller.label(for: $0)) }
         if let index = formats.firstIndex(where: { let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription); return d.width == 1920 && d.height == 1080 }) { resolution.selectItem(at: index); try? controller.select(formats[index]) }
@@ -257,13 +308,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordButton.isEnabled = true; status.stringValue = "已连接：\(device.localizedName)"
     }
 
+    private func requestMicrophone(for controller: CameraController) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: controller.enableMicrophone()
+        case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { controller.enableMicrophone() } } }
+        default: status.stringValue = "摄像头预览已就绪（未授权麦克风）"
+        }
+    }
+
+    private func requestMicrophone(for controller: ScreenController) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: controller.enableMicrophone()
+        case .notDetermined: AVCaptureDevice.requestAccess(for: .audio) { granted in if granted { DispatchQueue.main.async { controller.enableMicrophone() } } }
+        default: status.stringValue = "屏幕预览已就绪（未授权麦克风）"
+        }
+    }
+
     @objc private func changeSource() {
         guard !((controller?.isRecording ?? false) || (screenController?.isRecording ?? false)) else { return }
         if isScreenMode {
             controller?.session.stopRunning(); preview.isHidden = true; screenPreview.isHidden = false
-            resolution.removeAllItems(); resolution.addItem(withTitle: "连接屏幕中…"); resolution.isEnabled = false; recordButton.isEnabled = false
-            let screen = ScreenController(); screen.onFrame = { [weak self] sample in self?.screenPreview.enqueue(sample) }; screenController = screen
-            Task { do { let label = try await screen.startPreview(); await MainActor.run { self.resolution.removeAllItems(); self.resolution.addItem(withTitle: label); self.status.stringValue = "屏幕预览已就绪"; self.recordButton.isEnabled = true } } catch { await MainActor.run { self.showError("无法录制屏幕。请在“系统设置 → 隐私与安全性 → 屏幕录制”中允许终端访问。") } } }
+            resolution.removeAllItems(); resolution.addItem(withTitle: "读取显示器…"); resolution.isEnabled = false; recordButton.isEnabled = false
+            loadDisplays()
         } else {
             screenPreview.flushAndRemoveImage(); screenPreview.isHidden = true; preview.isHidden = false
             let oldScreenController = screenController
@@ -274,9 +340,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func changeResolution() {
+        if isScreenMode {
+            guard displays.indices.contains(resolution.indexOfSelectedItem) else { return }
+            startScreenPreview(on: displays[resolution.indexOfSelectedItem])
+            return
+        }
         guard let controller, resolution.indexOfSelectedItem >= 0 else { return }
         do { try controller.select(formats[resolution.indexOfSelectedItem]); status.stringValue = "分辨率已切换" }
         catch { showError("切换分辨率失败：\(error.localizedDescription)") }
+    }
+
+    private func loadDisplays() {
+        Task {
+            do {
+                let content = try await SCShareableContent.current
+                let found = content.displays
+                await MainActor.run {
+                    guard self.isScreenMode, !found.isEmpty else { self.showError("未找到可录制的显示器。"); return }
+                    self.displays = found
+                    self.resolution.removeAllItems()
+                    for (index, display) in found.enumerated() { self.resolution.addItem(withTitle: "显示器 \(index + 1)：\(display.width) × \(display.height)") }
+                    self.resolution.selectItem(at: 0); self.resolution.isEnabled = true
+                    self.startScreenPreview(on: found[0])
+                }
+            } catch { await MainActor.run { self.showError("无法读取显示器。请允许“屏幕录制”权限。") } }
+        }
+    }
+
+    private func startScreenPreview(on display: SCDisplay) {
+        recordButton.isEnabled = false; status.stringValue = "连接显示器…"
+        let old = screenController; screenController = nil; screenPreview.flushAndRemoveImage()
+        Task {
+            await old?.stopPreview()
+            let screen = ScreenController()
+            screen.onFrame = { [weak self] sample in self?.screenPreview.enqueue(sample) }
+            await MainActor.run { self.requestMicrophone(for: screen) }
+            do {
+                _ = try await screen.startPreview(display: display)
+                await MainActor.run {
+                    guard self.isScreenMode else { Task { await screen.stopPreview() }; return }
+                    self.screenController = screen; self.status.stringValue = "屏幕预览已就绪（含麦克风）"; self.recordButton.isEnabled = true
+                }
+            } catch { await MainActor.run { self.showError("无法录制屏幕。请在“系统设置 → 隐私与安全性 → 屏幕录制”中允许终端访问。") } }
+        }
     }
 
     @objc private func toggleRecording() {
