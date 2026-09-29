@@ -817,12 +817,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePlayback() {
         guard let player else { return }
         if player.rate == 0 {
+            playbackButton.title = "❚❚ Pause"
             let current = player.currentTime().seconds
             if current < trimStart - 0.01 || current >= trimEnd - 0.02 {
-                player.seek(to: CMTime(seconds: trimStart, preferredTimescale: 600))
+                // seek(to:) is asynchronous — play() called right after it can
+                // start from the pre-seek position if the seek hasn't landed
+                // yet, silently ignoring the trim start. Only play once the
+                // seek's completion handler confirms it actually moved.
+                player.seek(to: CMTime(seconds: trimStart, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                    self?.player?.play()
+                }
+            } else {
+                player.play()
             }
-            player.play()
-            playbackButton.title = "❚❚ Pause"
         } else {
             player.pause()
             playbackButton.title = "▶ Play"
