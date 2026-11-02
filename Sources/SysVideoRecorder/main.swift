@@ -316,8 +316,18 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         // enough for the realtime capture queue.
         guard now - lastMeterNanos >= 16_000_000 else { return }
         lastMeterNanos = now
-        guard let (level, peak) = audioLevel(from: sampleBuffer) else { return }
-        meterHandler(level, peak)
+        guard let channels = audioOutput.connection(with: .audio)?.audioChannels,
+              !channels.isEmpty else { return }
+        let meterChannels: [AVCaptureAudioChannel]
+        if let selectedAudioChannel, channels.indices.contains(selectedAudioChannel) {
+            meterChannels = [channels[selectedAudioChannel]]
+        } else {
+            meterChannels = channels
+        }
+        let powers = meterChannels.map { pow(10.0, Double($0.averagePowerLevel) / 10.0) }
+        let level = powers.isEmpty ? 0 : sqrt(powers.reduce(0, +) / Double(powers.count))
+        let peak = meterChannels.map { pow(10.0, Double($0.peakHoldLevel) / 20.0) }.max() ?? 0
+        meterHandler(min(1, level), min(1, peak))
     }
 }
 
@@ -623,13 +633,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         root.addSubview(bar)
         let meterRow = NSStackView(views: [fieldLabel("Input level"), levelMeter, meterValue, clipLabel])
         meterRow.orientation = .horizontal; meterRow.spacing = 9; meterRow.alignment = .centerY
-        meterRow.frame = NSRect(x: 28, y: 224, width: 380, height: 20); meterRow.autoresizingMask = [.maxYMargin]
+        meterRow.frame = NSRect(x: 14, y: 82, width: 380, height: 20)
         levelMeter.translatesAutoresizingMaskIntoConstraints = false
         levelMeter.widthAnchor.constraint(equalToConstant: 190).isActive = true
         levelMeter.heightAnchor.constraint(equalToConstant: 14).isActive = true
         meterValue.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         clipLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold); clipLabel.textColor = .systemRed; clipLabel.isHidden = true
-        root.addSubview(meterRow)
 
         let waveformCard = NSView(frame: NSRect(x: 16, y: 128, width: 998, height: 110))
         waveformCard.autoresizingMask = [.width, .maxYMargin]
@@ -639,7 +648,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         waveformCard.layer?.borderWidth = 1
         waveformCard.layer?.borderColor = NSColor(calibratedWhite: 0.86, alpha: 1).cgColor
         root.addSubview(waveformCard)
-        waveform.frame = waveformCard.bounds.insetBy(dx: 8, dy: 8)
+        waveformCard.addSubview(meterRow)
+        waveform.frame = NSRect(x: 8, y: 8, width: waveformCard.bounds.width - 16, height: 66)
         waveform.autoresizingMask = [.width, .height]
         waveform.wantsLayer = true
         waveform.layer?.cornerRadius = 8
