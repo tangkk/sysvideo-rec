@@ -2,6 +2,27 @@ import AudioToolbox
 import CoreMedia
 import Foundation
 
+func videoAudioLevel(from data: Data, inputChannels: Int, selectedChannel: Int?) -> (level: Double, peak: Double)? {
+    guard inputChannels > 0,
+          selectedChannel.map({ (0..<inputChannels).contains($0) }) ?? true else { return nil }
+    let frames = data.count / (inputChannels * MemoryLayout<Int16>.size)
+    guard frames > 0 else { return nil }
+    let meteredChannels = selectedChannel == nil ? min(inputChannels, 2) : 1
+    var sum = 0.0
+    var peak = 0.0
+    data.withUnsafeBytes { raw in
+        let samples = raw.bindMemory(to: Int16.self)
+        for frame in 0..<frames {
+            for channel in 0..<meteredChannels {
+                let value = Double(samples[frame * inputChannels + (selectedChannel ?? channel)]) / Double(Int16.max)
+                sum += value * value
+                peak = max(peak, abs(value))
+            }
+        }
+    }
+    return (sqrt(sum / Double(frames * meteredChannels)), peak)
+}
+
 /// Takes the exact CoreAudio input channel selected by the user and gives
 /// AVAssetWriter a mono (or first-two-channel stereo) PCM sample buffer.
 func videoAudioSampleBuffer(

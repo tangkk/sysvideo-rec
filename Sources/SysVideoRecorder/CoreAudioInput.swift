@@ -114,7 +114,6 @@ final class CoreAudioInputCapture {
             }
             lock.lock(); queue = newQueue; running = true; lock.unlock()
             try requireAudioStatus(AudioQueueStart(newQueue, nil), "Start audio capture")
-            print("[sysvideo-rec] CoreAudio capture: \(device.name), \(actual.mChannelsPerFrame) channels, \(actual.mSampleRate) Hz")
         } catch {
             lock.lock(); queue = nil; running = false; lock.unlock()
             AudioQueueDispose(newQueue, true)

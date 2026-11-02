@@ -256,11 +256,11 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     private(set) var isRecording = false
 
     /// Called (off the main thread) with a quick RMS/peak level for every
-    /// microphone buffer received while recording, for driving a live waveform.
+    /// microphone buffer received, including before recording starts.
     var meterHandler: ((Double, Double) -> Void)?
+    var errorHandler: ((String) -> Void)?
     private var lastMeterNanos: UInt64 = 0
-    private var loggedAudioFormat = false
-    private var lastMeterLogNanos: UInt64 = 0
+    private var didReportAudioError = false
 
     init?(device: AVCaptureDevice) {
         self.device = device
@@ -308,6 +308,9 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
 
     func setMicrophone(_ microphone: AVCaptureDevice) {
         guard !isRecording else { return }
+        stopMonitoring()
+        queue.sync { }
+        didReportAudioError = false
         session.beginConfiguration()
         if let microphoneInput { session.removeInput(microphoneInput) }
         microphoneInput = nil
@@ -317,7 +320,6 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             audioChannelCount = coreAudioDevice.channelCount
             selectedAudioChannel = nil
             session.commitConfiguration()
-            print("[sysvideo-rec] Microphone '\(microphone.localizedName)' uses CoreAudio with \(audioChannelCount) input channel(s)")
             return
         }
         guard let input = try? AVCaptureDeviceInput(device: microphone) else { session.commitConfiguration(); return }
@@ -328,7 +330,6 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         session.addOutput(audioOutput)
         let channels = audioOutput.connection(with: .audio)?.audioChannels ?? []
         audioChannelCount = channels.count
-        print("[sysvideo-rec] Microphone '\(microphone.localizedName)' connected with \(channels.count) AVFoundation audio channel(s)")
         selectedAudioChannel = nil
         channels.forEach { $0.isEnabled = true }
         session.commitConfiguration()
@@ -337,23 +338,48 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     func refreshAudioChannelCount() {
         if let coreAudioDevice {
             audioChannelCount = coreAudioDevice.channelCount
-            print("[sysvideo-rec] CoreAudio input exposes \(audioChannelCount) channel(s)")
             return
         }
         audioChannelCount = audioOutput.connection(with: .audio)?.audioChannels.count ?? 0
-        print("[sysvideo-rec] Active audio connection exposes \(audioChannelCount) channel(s)")
     }
 
     func selectAudioChannel(_ channelIndex: Int?) {
         guard !isRecording else { return }
         guard channelIndex.map({ (0..<audioChannelCount).contains($0) }) ?? true else { return }
-        selectedAudioChannel = channelIndex
+        queue.sync { selectedAudioChannel = channelIndex }
         audioOutput.connection(with: .audio)?.audioChannels.forEach { $0.isEnabled = true }
-        print("[sysvideo-rec] Selected input channel: \(channelIndex.map { "CH\($0 + 1)" } ?? "all channels"); capture=\(coreAudioDevice == nil ? "AVFoundation" : "CoreAudio")")
+    }
+
+    func startMonitoring() throws {
+        guard coreAudioCapture == nil, let coreAudioDevice else { return }
+        let capture = CoreAudioInputCapture(device: coreAudioDevice) { [weak self] data, time, channels, rate in
+            self?.queue.async { [weak self] in
+                self?.handleCoreAudioBuffer(data, at: time, inputChannels: channels, sampleRate: rate)
+            }
+        }
+        try capture.start()
+        if let selectedAudioChannel, selectedAudioChannel >= capture.streamChannels {
+            capture.stop()
+            throw CoreAudioInputError.unavailableChannel(selectedAudioChannel + 1, capture.streamChannels)
+        }
+        coreAudioCapture = capture
+    }
+
+    func stopMonitoring() {
+        coreAudioCapture?.stop()
+        coreAudioCapture = nil
+    }
+
+    private func reportAudioError(_ message: String) {
+        guard !didReportAudioError else { return }
+        didReportAudioError = true
+        errorHandler?(message)
     }
 
     func startRecording(to url: URL, format: OutputFormat) throws {
         guard !isRecording else { return }
+        try startMonitoring()
+        didReportAudioError = false
         let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
         let bitrate = max(2_000_000, min(16_000_000, Int(dimensions.width * dimensions.height) * 5))
         let settings: [String: Any] = [
@@ -384,33 +410,9 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         startedAt = nil
         audioTimeOffset = .zero
         isRecording = true
-        if let coreAudioDevice {
-            let capture = CoreAudioInputCapture(device: coreAudioDevice) { [weak self] data, time, channels, rate in
-                self?.queue.async { [weak self] in
-                    self?.handleCoreAudioBuffer(data, at: time, inputChannels: channels, sampleRate: rate)
-                }
-            }
-            do {
-                try capture.start()
-                if let selectedAudioChannel, selectedAudioChannel >= capture.streamChannels {
-                    capture.stop()
-                    throw CoreAudioInputError.unavailableChannel(selectedAudioChannel + 1, capture.streamChannels)
-                }
-                coreAudioCapture = capture
-            } catch {
-                isRecording = false
-                writer.cancelWriting()
-                self.writer = nil
-                self.writerInput = nil
-                audioWriterInput = nil
-                throw error
-            }
-        }
     }
 
     func stopRecording(completion: @escaping (Result<Void, Error>) -> Void) {
-        coreAudioCapture?.stop()
-        coreAudioCapture = nil
         queue.async {
             guard self.isRecording else { return }
             self.isRecording = false
@@ -426,33 +428,27 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard isRecording, let writer else { return }
         if output === audioOutput {
-            if !loggedAudioFormat {
-                loggedAudioFormat = true
-                let asbd = CMSampleBufferGetFormatDescription(sampleBuffer).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
-                var neededSize = 0
-                _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, bufferListSizeNeededOut: &neededSize, bufferListOut: nil, bufferListSize: 0, blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault, flags: 0, blockBufferOut: nil)
-                print("[sysvideo-rec] First audio sample: ASBD channels=\(asbd?.mChannelsPerFrame ?? 0), selected channel=\(selectedAudioChannel.map { String($0 + 1) } ?? "all"), buffer-list bytes=\(neededSize)")
-            }
             emitMeter(for: sampleBuffer)
+            guard isRecording, let writer else { return }
             guard startedAt != nil, let input = audioWriterInput else { return }
             guard input.isReadyForMoreMediaData else { return }
             if let selectedAudioChannel {
                 guard let monoBuffer = monoSampleBuffer(from: sampleBuffer, channel: selectedAudioChannel) else {
-                    print("[sysvideo-rec] Could not extract CH\(selectedAudioChannel + 1) from the incoming audio buffer")
+                    reportAudioError("Could not read CH\(selectedAudioChannel + 1) from the audio input")
                     return
                 }
                 if !input.append(monoBuffer) {
-                    print("[sysvideo-rec] Audio append failed: \(writer.error?.localizedDescription ?? "unknown writer error")")
+                    reportAudioError("Audio write failed: \(writer.error?.localizedDescription ?? "unknown error")")
                 }
             } else {
                 if !input.append(sampleBuffer) {
-                    print("[sysvideo-rec] Audio append failed: \(writer.error?.localizedDescription ?? "unknown writer error")")
+                    reportAudioError("Audio write failed: \(writer.error?.localizedDescription ?? "unknown error")")
                 }
             }
             return
         }
+        guard isRecording, let writer else { return }
         guard let input = writerInput else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if startedAt == nil {
@@ -473,18 +469,24 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         lastMeterNanos = now
         guard let (level, peak) = audioLevel(from: sampleBuffer, selectedChannel: selectedAudioChannel) else { return }
         meterHandler(level, peak)
-        if now - lastMeterLogNanos >= 1_000_000_000 {
-            lastMeterLogNanos = now
-            let channel = selectedAudioChannel.map { "CH\($0 + 1)" } ?? "all channels"
-            print(String(format: "[sysvideo-rec] %@ RMS %.1f dBFS, peak %.1f dBFS", channel, level > 0 ? 20 * log10(level) : -120, peak > 0 ? 20 * log10(peak) : -120))
-        }
     }
 
     private func handleCoreAudioBuffer(_ data: Data, at hostTime: CMTime, inputChannels: Int, sampleRate: Double) {
-        guard isRecording, let writer else { return }
+        if !isRecording {
+            guard let measured = videoAudioLevel(from: data, inputChannels: inputChannels, selectedChannel: selectedAudioChannel) else {
+                reportAudioError("Could not read the selected audio input")
+                return
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now - lastMeterNanos >= 16_000_000 {
+                lastMeterNanos = now
+                meterHandler?(measured.level, measured.peak)
+            }
+            return
+        }
         let presentationTime = CMTimeAdd(hostTime, audioTimeOffset)
         guard let converted = videoAudioSampleBuffer(from: data, sampleRate: sampleRate, inputChannels: inputChannels, selectedChannel: selectedAudioChannel, at: presentationTime) else {
-            print("[sysvideo-rec] CoreAudio PCM conversion failed")
+            reportAudioError("Could not read the selected audio input")
             return
         }
         let now = DispatchTime.now().uptimeNanoseconds
@@ -492,15 +494,10 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
             lastMeterNanos = now
             meterHandler?(converted.level, converted.peak)
         }
-        if now - lastMeterLogNanos >= 1_000_000_000 {
-            lastMeterLogNanos = now
-            let channel = selectedAudioChannel.map { "CH\($0 + 1)" } ?? "all channels"
-            print(String(format: "[sysvideo-rec] CoreAudio %@ RMS %.1f dBFS, peak %.1f dBFS", channel, converted.level > 0 ? 20 * log10(converted.level) : -120, converted.peak > 0 ? 20 * log10(converted.peak) : -120))
-        }
-        guard let startedAt, CMTimeCompare(presentationTime, startedAt) >= 0,
+        guard isRecording, let writer, let startedAt, CMTimeCompare(presentationTime, startedAt) >= 0,
               let audioWriterInput, audioWriterInput.isReadyForMoreMediaData else { return }
         if !audioWriterInput.append(converted.buffer) {
-            print("[sysvideo-rec] CoreAudio append failed: \(writer.error?.localizedDescription ?? "unknown writer error")")
+            reportAudioError("Audio write failed: \(writer.error?.localizedDescription ?? "unknown error")")
         }
     }
 }
@@ -755,6 +752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
+        controller?.stopMonitoring()
         if let tempURL = recordingTempURL { try? FileManager.default.removeItem(at: tempURL) }
     }
 
@@ -929,13 +927,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let device = devices.first, let controller = CameraController(device: device) else { showError("No camera was found."); return }
         self.controller = controller; preview.session = controller.session
         controller.meterHandler = { [weak self] level, peak in
+            let recording = self?.controller?.isRecording == true
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.waveform.append(level: level, peak: peak)
+                if recording { self.waveform.append(level: level, peak: peak) }
                 self.levelMeter.setLevels(level, peak: peak)
                 self.meterValue.stringValue = peak > 0 ? String(format: "%.1f dBFS", 20 * log10(peak)) : "−∞ dBFS"
                 if peak >= 0.999 { self.clipLabel.isHidden = false }
             }
+        }
+        controller.errorHandler = { [weak self] message in
+            DispatchQueue.main.async { self?.status.stringValue = message }
         }
         loadMicrophones(prefer: device)
         formats = controller.availableFormats()
@@ -975,7 +977,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureMicrophone(_ selected: AVCaptureDevice) {
         controller?.setMicrophone(selected)
         refreshAudioChannels()
-        status.stringValue = "Microphone: \(selected.localizedName)"
+        do {
+            try controller?.startMonitoring()
+            status.stringValue = "Microphone: \(selected.localizedName)"
+        } catch {
+            showError("Input monitor could not start: \(error.localizedDescription)")
+        }
     }
 
     private func refreshAudioChannels() {
