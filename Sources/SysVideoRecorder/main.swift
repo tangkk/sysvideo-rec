@@ -55,7 +55,7 @@ enum OutputFormat: String, CaseIterable {
 /// Computes a quick RMS/peak level from a raw microphone sample buffer, for
 /// driving a live waveform display. Not involved in the actual recorded
 /// audio path (AVAssetWriterInput consumes the original sample buffer).
-func audioLevel(from sampleBuffer: CMSampleBuffer) -> (level: Double, peak: Double)? {
+func audioLevel(from sampleBuffer: CMSampleBuffer, selectedChannel: Int?) -> (level: Double, peak: Double)? {
     guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
           let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
         return nil
@@ -96,7 +96,7 @@ func audioLevel(from sampleBuffer: CMSampleBuffer) -> (level: Double, peak: Doub
     guard status == noErr else { return nil }
 
     let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
-    guard let firstBuffer = buffers.first, let data = firstBuffer.mData else { return nil }
+    guard !buffers.isEmpty else { return nil }
     let flags = asbd.mFormatFlags
     let isFloat = (flags & kAudioFormatFlagIsFloat) != 0
     let isSignedInteger = (flags & kAudioFormatFlagIsSignedInteger) != 0
@@ -106,30 +106,103 @@ func audioLevel(from sampleBuffer: CMSampleBuffer) -> (level: Double, peak: Doub
     var peak = 0.0
     var count = 0
 
-    if isFloat, bitsPerChannel == 32 {
-        let available = min(frameCount * channelCount, Int(firstBuffer.mDataByteSize) / MemoryLayout<Float>.size)
-        let samples = data.assumingMemoryBound(to: Float.self)
-        for i in 0..<available {
-            let normalized = Double(samples[i])
-            sum += normalized * normalized
-            peak = max(peak, abs(normalized))
-            count += 1
-        }
-    } else if isSignedInteger, bitsPerChannel == 16 {
-        let available = min(frameCount * channelCount, Int(firstBuffer.mDataByteSize) / MemoryLayout<Int16>.size)
-        let samples = data.assumingMemoryBound(to: Int16.self)
-        for i in 0..<available {
-            let normalized = Double(samples[i]) / Double(Int16.max)
-            sum += normalized * normalized
-            peak = max(peak, abs(normalized))
-            count += 1
-        }
-    } else {
+    guard (isFloat && bitsPerChannel == 32) || (isSignedInteger && bitsPerChannel == 16) else {
         return nil
+    }
+
+    for (bufferIndex, buffer) in buffers.enumerated() {
+        guard let data = buffer.mData else { continue }
+        let sampleSize = isFloat ? MemoryLayout<Float>.size : MemoryLayout<Int16>.size
+        let available = Int(buffer.mDataByteSize) / sampleSize
+        let samplesPerFrame = max(1, Int(buffer.mNumberChannels))
+        let planar = buffers.count == channelCount && buffers.allSatisfy { $0.mNumberChannels == 1 }
+        let samplesToRead: AnySequence<Int>
+        if let selectedChannel {
+            if planar {
+                samplesToRead = bufferIndex == selectedChannel ? AnySequence(0..<available) : AnySequence(EmptyCollection<Int>())
+            } else if channelCount == 1 {
+                // AVCapture may compact the stream to the enabled channel.
+                samplesToRead = AnySequence(0..<available)
+            } else {
+                samplesToRead = AnySequence(Swift.stride(from: selectedChannel, to: available, by: samplesPerFrame))
+            }
+        } else {
+            samplesToRead = AnySequence(0..<available)
+        }
+        if isFloat {
+            let samples = data.assumingMemoryBound(to: Float.self)
+            for index in samplesToRead {
+                let value = Double(samples[index]); sum += value * value; peak = max(peak, abs(value)); count += 1
+            }
+        } else {
+            let samples = data.assumingMemoryBound(to: Int16.self)
+            for index in samplesToRead {
+                let value = Double(samples[index]) / Double(Int16.max); sum += value * value; peak = max(peak, abs(value)); count += 1
+            }
+        }
     }
 
     guard count > 0 else { return nil }
     return (sqrt(sum / Double(count)), peak)
+}
+
+func monoSampleBuffer(from sampleBuffer: CMSampleBuffer, channel requestedChannel: Int) -> CMSampleBuffer? {
+    guard let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+          let sourceASBDPointer = CMAudioFormatDescriptionGetStreamBasicDescription(description) else { return nil }
+    let asbd = sourceASBDPointer.pointee
+    let sourceChannelCount = Int(asbd.mChannelsPerFrame)
+    let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
+    guard sourceChannelCount > 0, frameCount > 0 else { return nil }
+    let bits = Int(asbd.mBitsPerChannel)
+    let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0 && bits == 32
+    let isInt16 = (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0 && bits == 16
+    guard isFloat || isInt16 else { return nil }
+    let sampleSize = isFloat ? MemoryLayout<Float>.size : MemoryLayout<Int16>.size
+
+    var neededSize = 0
+    var retainedBlock: CMBlockBuffer?
+    guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, bufferListSizeNeededOut: &neededSize, bufferListOut: nil, bufferListSize: 0, blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault, flags: 0, blockBufferOut: &retainedBlock) == noErr, neededSize > 0 else { return nil }
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: neededSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+    defer { raw.deallocate() }
+    let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+    guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, bufferListSizeNeededOut: nil, bufferListOut: list, bufferListSize: neededSize, blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault, flags: 0, blockBufferOut: &retainedBlock) == noErr else { return nil }
+    let buffers = UnsafeMutableAudioBufferListPointer(list)
+    let planar = buffers.count == sourceChannelCount && buffers.allSatisfy { $0.mNumberChannels == 1 }
+    let channel = sourceChannelCount == 1 ? 0 : requestedChannel
+    guard channel >= 0, channel < sourceChannelCount else { return nil }
+    let source: UnsafeMutableAudioBufferListPointer.Element
+    if planar {
+        guard buffers.indices.contains(channel) else { return nil }
+        source = buffers[channel]
+    } else {
+        guard let first = buffers.first else { return nil }
+        source = first
+    }
+    guard let sourceBytes = source.mData else { return nil }
+    let destination = UnsafeMutableRawPointer.allocate(byteCount: frameCount * sampleSize, alignment: sampleSize)
+    defer { destination.deallocate() }
+    let sourceSampleCount = Int(source.mDataByteSize) / sampleSize
+    for frame in 0..<frameCount {
+        let sourceIndex = planar || sourceChannelCount == 1 ? frame : frame * sourceChannelCount + channel
+        guard sourceIndex < sourceSampleCount else { return nil }
+        memcpy(destination.advanced(by: frame * sampleSize), sourceBytes.advanced(by: sourceIndex * sampleSize), sampleSize)
+    }
+
+    var monoASBD = asbd
+    monoASBD.mChannelsPerFrame = 1
+    monoASBD.mBytesPerFrame = UInt32(sampleSize)
+    monoASBD.mBytesPerPacket = UInt32(sampleSize) * max(1, monoASBD.mFramesPerPacket)
+    var monoDescription: CMAudioFormatDescription?
+    guard CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &monoASBD, layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &monoDescription) == noErr, let monoDescription else { return nil }
+
+    var monoBlock: CMBlockBuffer?
+    guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: frameCount * sampleSize, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: frameCount * sampleSize, flags: 0, blockBufferOut: &monoBlock) == kCMBlockBufferNoErr, let monoBlock else { return nil }
+    guard CMBlockBufferReplaceDataBytes(with: destination, blockBuffer: monoBlock, offsetIntoDestination: 0, dataLength: frameCount * sampleSize) == kCMBlockBufferNoErr else { return nil }
+
+    var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(sampleBuffer), presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), decodeTimeStamp: CMSampleBufferGetDecodeTimeStamp(sampleBuffer))
+    var output: CMSampleBuffer?
+    guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: monoBlock, formatDescription: monoDescription, sampleCount: frameCount, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &output) == noErr else { return nil }
+    return output
 }
 
 /// Trims a passthrough (no re-encode) time range out of a recorded video into
@@ -183,6 +256,8 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     /// microphone buffer received while recording, for driving a live waveform.
     var meterHandler: ((Double, Double) -> Void)?
     private var lastMeterNanos: UInt64 = 0
+    private var loggedAudioFormat = false
+    private var lastMeterLogNanos: UInt64 = 0
 
     init?(device: AVCaptureDevice) {
         self.device = device
@@ -240,15 +315,22 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         session.addOutput(audioOutput)
         let channels = audioOutput.connection(with: .audio)?.audioChannels ?? []
         audioChannelCount = channels.count
+        print("[sysvideo-rec] Microphone '\(microphone.localizedName)' connected with \(channels.count) AVFoundation audio channel(s)")
         selectedAudioChannel = nil
         channels.forEach { $0.isEnabled = true }
         session.commitConfiguration()
     }
 
+    func refreshAudioChannelCount() {
+        audioChannelCount = audioOutput.connection(with: .audio)?.audioChannels.count ?? 0
+        print("[sysvideo-rec] Active audio connection exposes \(audioChannelCount) channel(s)")
+    }
+
     func selectAudioChannel(_ channelIndex: Int?) {
         guard !isRecording, let channels = audioOutput.connection(with: .audio)?.audioChannels else { return }
         selectedAudioChannel = channelIndex
-        for (index, channel) in channels.enumerated() { channel.isEnabled = channelIndex == nil || index == channelIndex }
+        channels.forEach { $0.isEnabled = true }
+        print("[sysvideo-rec] Selected input channel: \(channelIndex.map { "CH\($0 + 1)" } ?? "all channels"); software extraction enabled")
     }
 
     func startRecording(to url: URL, format: OutputFormat) throws {
@@ -294,9 +376,29 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard isRecording, let writer else { return }
         if output === audioOutput {
+            if !loggedAudioFormat {
+                loggedAudioFormat = true
+                let asbd = CMSampleBufferGetFormatDescription(sampleBuffer).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
+                var neededSize = 0
+                _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sampleBuffer, bufferListSizeNeededOut: &neededSize, bufferListOut: nil, bufferListSize: 0, blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault, flags: 0, blockBufferOut: nil)
+                print("[sysvideo-rec] First audio sample: ASBD channels=\(asbd?.mChannelsPerFrame ?? 0), selected channel=\(selectedAudioChannel.map { String($0 + 1) } ?? "all"), buffer-list bytes=\(neededSize)")
+            }
             emitMeter(for: sampleBuffer)
             guard startedAt != nil, let input = audioWriterInput else { return }
-            if input.isReadyForMoreMediaData { input.append(sampleBuffer) }
+            guard input.isReadyForMoreMediaData else { return }
+            if let selectedAudioChannel {
+                guard let monoBuffer = monoSampleBuffer(from: sampleBuffer, channel: selectedAudioChannel) else {
+                    print("[sysvideo-rec] Could not extract CH\(selectedAudioChannel + 1) from the incoming audio buffer")
+                    return
+                }
+                if !input.append(monoBuffer) {
+                    print("[sysvideo-rec] Audio append failed: \(writer.error?.localizedDescription ?? "unknown writer error")")
+                }
+            } else {
+                if !input.append(sampleBuffer) {
+                    print("[sysvideo-rec] Audio append failed: \(writer.error?.localizedDescription ?? "unknown writer error")")
+                }
+            }
             return
         }
         guard let input = writerInput else { return }
@@ -316,18 +418,13 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         // enough for the realtime capture queue.
         guard now - lastMeterNanos >= 16_000_000 else { return }
         lastMeterNanos = now
-        guard let channels = audioOutput.connection(with: .audio)?.audioChannels,
-              !channels.isEmpty else { return }
-        let meterChannels: [AVCaptureAudioChannel]
-        if let selectedAudioChannel, channels.indices.contains(selectedAudioChannel) {
-            meterChannels = [channels[selectedAudioChannel]]
-        } else {
-            meterChannels = channels
+        guard let (level, peak) = audioLevel(from: sampleBuffer, selectedChannel: selectedAudioChannel) else { return }
+        meterHandler(level, peak)
+        if now - lastMeterLogNanos >= 1_000_000_000 {
+            lastMeterLogNanos = now
+            let channel = selectedAudioChannel.map { "CH\($0 + 1)" } ?? "all channels"
+            print(String(format: "[sysvideo-rec] %@ RMS %.1f dBFS, peak %.1f dBFS", channel, level > 0 ? 20 * log10(level) : -120, peak > 0 ? 20 * log10(peak) : -120))
         }
-        let powers = meterChannels.map { pow(10.0, Double($0.averagePowerLevel) / 10.0) }
-        let level = powers.isEmpty ? 0 : sqrt(powers.reduce(0, +) / Double(powers.count))
-        let peak = meterChannels.map { pow(10.0, Double($0.peakHoldLevel) / 20.0) }.max() ?? 0
-        meterHandler(min(1, level), min(1, peak))
     }
 }
 
@@ -759,6 +856,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         formats.forEach { resolution.addItem(withTitle: controller.label(for: $0)) }
         if let index = formats.firstIndex(where: { let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription); return d.width == 1920 && d.height == 1080 }) { resolution.selectItem(at: index); try? controller.select(formats[index]) }
         controller.session.startRunning()
+        controller.refreshAudioChannelCount()
+        refreshAudioChannels()
         recordButton.isEnabled = true; status.stringValue = "Connected: \(device.localizedName)"
     }
 
