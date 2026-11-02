@@ -171,6 +171,8 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
     private let audioOutput = AVCaptureAudioDataOutput()
     private let device: AVCaptureDevice
     private var microphoneInput: AVCaptureDeviceInput?
+    private(set) var audioChannelCount = 0
+    private var selectedAudioChannel: Int?
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
     private var audioWriterInput: AVAssetWriterInput?
@@ -236,7 +238,17 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         microphoneInput = input
         audioOutput.setSampleBufferDelegate(self, queue: queue)
         session.addOutput(audioOutput)
+        let channels = audioOutput.connection(with: .audio)?.audioChannels ?? []
+        audioChannelCount = channels.count
+        selectedAudioChannel = nil
+        channels.forEach { $0.isEnabled = true }
         session.commitConfiguration()
+    }
+
+    func selectAudioChannel(_ channelIndex: Int?) {
+        guard !isRecording, let channels = audioOutput.connection(with: .audio)?.audioChannels else { return }
+        selectedAudioChannel = channelIndex
+        for (index, channel) in channels.enumerated() { channel.isEnabled = channelIndex == nil || index == channelIndex }
     }
 
     func startRecording(to url: URL, format: OutputFormat) throws {
@@ -255,7 +267,8 @@ final class CameraController: NSObject, AVCaptureVideoDataOutputSampleBufferDele
         writerInput?.expectsMediaDataInRealTime = true
         guard let writer, let writerInput, writer.canAdd(writerInput) else { throw RecorderError.writerSetup }
         writer.add(writerInput)
-        let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128_000]
+        let outputChannels = selectedAudioChannel == nil ? 2 : 1
+        let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: outputChannels, AVEncoderBitRateKey: 128_000]
         let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
         audioInput.expectsMediaDataInRealTime = true
         if session.inputs.contains(where: { ($0 as? AVCaptureDeviceInput)?.device.hasMediaType(.audio) == true }) && writer.canAdd(audioInput) { writer.add(audioInput); audioWriterInput = audioInput }
@@ -314,6 +327,25 @@ enum RecorderError: LocalizedError { case writerSetup; var errorDescription: Str
 /// Recording stops appending to it, so once stopped the bars simply stay put
 /// — the trim UI only adds a selection overlay on top, it never redraws the
 /// bars with different data.
+final class LiveLevelMeterView: NSView {
+    private var rms: CGFloat = 0
+    private var peak: CGFloat = 0
+    func setLevels(_ rms: Double, peak: Double) { self.rms = CGFloat(max(0, min(1, rms))); self.peak = CGFloat(max(0, min(1, peak))); needsDisplay = true }
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let track = bounds.insetBy(dx: 1, dy: 2)
+        NSColor(calibratedWhite: 0.88, alpha: 1).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
+        let db = rms > 0 ? 20 * log10(Double(rms)) : -60
+        let fraction = CGFloat(max(0, min(1, (db + 60) / 60)))
+        let fill = NSRect(x: track.minX, y: track.minY, width: track.width * fraction, height: track.height)
+        NSColor.systemGreen.setFill(); NSBezierPath(roundedRect: fill, xRadius: 4, yRadius: 4).fill()
+        let peakDB = peak > 0 ? 20 * log10(Double(peak)) : -60
+        let peakFraction = CGFloat(max(0, min(1, (peakDB + 60) / 60)))
+        NSColor.black.setFill(); NSBezierPath(rect: NSRect(x: min(track.minX + track.width * peakFraction, track.maxX - 2), y: track.minY, width: 2, height: track.height)).fill()
+    }
+}
+
 final class LiveWaveformView: NSView {
     private var samples: [CGFloat] = []
     private var duration: Double = 0
@@ -490,11 +522,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1_030, height: 780), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
     private let preview = AVCaptureVideoPreviewLayer()
     private let microphone = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
+    private let audioChannel = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
     private let resolution = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
     private let output = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
     private let recordButton = NSButton(title: "● Record", target: nil, action: nil)
     private let status = NSTextField(labelWithString: "Preparing…")
     private let waveform = LiveWaveformView(frame: .zero)
+    private let levelMeter = LiveLevelMeterView(frame: .zero)
+    private let meterValue = NSTextField(labelWithString: "−∞ dBFS")
+    private let clipLabel = NSTextField(labelWithString: "CLIP")
     private let trimLabel = NSTextField(labelWithString: "Trim: 00:00 – 00:00")
     private let resetTrimButton = NSButton(title: "Reset Trim", target: nil, action: nil)
     private let clearButton = NSButton(title: "✕ Clear", target: nil, action: nil)
@@ -559,7 +595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             label.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
             return label
         }
-        let bar = NSStackView(views: [fieldLabel("Microphone"), microphone, fieldLabel("Resolution"), resolution, fieldLabel("Format"), output, recordButton, status])
+        let bar = NSStackView(views: [fieldLabel("Microphone"), microphone, fieldLabel("Channel"), audioChannel, fieldLabel("Resolution"), resolution, fieldLabel("Format"), output, recordButton, status])
         bar.orientation = .horizontal
         bar.spacing = 10
         bar.alignment = .centerY
@@ -572,9 +608,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bar.layer?.borderWidth = 1
         bar.layer?.borderColor = NSColor(calibratedWhite: 0.86, alpha: 1).cgColor
         microphone.widthAnchor.constraint(equalToConstant: 165).isActive = true
+        audioChannel.widthAnchor.constraint(equalToConstant: 120).isActive = true
         resolution.widthAnchor.constraint(equalToConstant: 165).isActive = true
         output.widthAnchor.constraint(equalToConstant: 130).isActive = true
         microphone.contentTintColor = .black
+        audioChannel.contentTintColor = .black
         resolution.contentTintColor = .black
         output.contentTintColor = .black
         recordButton.bezelColor = NSColor(calibratedRed: 0.73, green: 0.11, blue: 0.11, alpha: 1)
@@ -583,6 +621,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         status.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         root.addSubview(bar)
+        let meterRow = NSStackView(views: [fieldLabel("Input level"), levelMeter, meterValue, clipLabel])
+        meterRow.orientation = .horizontal; meterRow.spacing = 9; meterRow.alignment = .centerY
+        meterRow.frame = NSRect(x: 28, y: 224, width: 380, height: 20); meterRow.autoresizingMask = [.maxYMargin]
+        levelMeter.translatesAutoresizingMaskIntoConstraints = false
+        levelMeter.widthAnchor.constraint(equalToConstant: 190).isActive = true
+        levelMeter.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        meterValue.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        clipLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold); clipLabel.textColor = .systemRed; clipLabel.isHidden = true
+        root.addSubview(meterRow)
 
         let waveformCard = NSView(frame: NSRect(x: 16, y: 128, width: 998, height: 110))
         waveformCard.autoresizingMask = [.width, .maxYMargin]
@@ -667,6 +714,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         OutputFormat.allCases.forEach { output.addItem(withTitle: $0.rawValue) }
         microphone.target = self; microphone.action = #selector(changeMicrophone)
+        audioChannel.target = self; audioChannel.action = #selector(changeAudioChannel)
         microphone.isEnabled = false
         resolution.target = self; resolution.action = #selector(changeResolution)
         recordButton.target = self; recordButton.action = #selector(toggleRecording)
@@ -688,7 +736,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let device = devices.first, let controller = CameraController(device: device) else { showError("No camera was found."); return }
         self.controller = controller; preview.session = controller.session
         controller.meterHandler = { [weak self] level, peak in
-            DispatchQueue.main.async { self?.waveform.append(level: level, peak: peak) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.waveform.append(level: level, peak: peak)
+                self.levelMeter.setLevels(level, peak: peak)
+                self.meterValue.stringValue = peak > 0 ? String(format: "%.1f dBFS", 20 * log10(peak)) : "−∞ dBFS"
+                if peak >= 0.999 { self.clipLabel.isHidden = false }
+            }
         }
         loadMicrophones(prefer: device)
         formats = controller.availableFormats()
@@ -725,9 +779,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureMicrophone(_ selected: AVCaptureDevice) {
         controller?.setMicrophone(selected)
+        refreshAudioChannels()
         status.stringValue = "Microphone: \(selected.localizedName)"
     }
 
+    private func refreshAudioChannels() {
+        let previous = audioChannel.indexOfSelectedItem
+        audioChannel.removeAllItems(); audioChannel.addItem(withTitle: "All (stereo)")
+        let count = controller?.audioChannelCount ?? 0
+        for channel in 0..<count { audioChannel.addItem(withTitle: "CH\(channel + 1) Mono") }
+        audioChannel.selectItem(at: min(max(0, previous), audioChannel.numberOfItems - 1))
+        audioChannel.isEnabled = count > 1
+        controller?.selectAudioChannel(audioChannel.indexOfSelectedItem > 0 ? audioChannel.indexOfSelectedItem - 1 : nil)
+    }
+    @objc private func changeAudioChannel() { controller?.selectAudioChannel(audioChannel.indexOfSelectedItem > 0 ? audioChannel.indexOfSelectedItem - 1 : nil) }
     @objc private func changeMicrophone() { applyMicrophone() }
 
     @objc private func changeResolution() {
@@ -740,6 +805,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let controller else { return }
         if controller.isRecording { stopRecording(); return }
         discardPendingRecording()
+        levelMeter.setLevels(0, peak: 0); meterValue.stringValue = "−∞ dBFS"; clipLabel.isHidden = true
         let format = OutputFormat.allCases[output.indexOfSelectedItem]
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("sysvideo-rec-\(UUID().uuidString).\(format.extensionName)")
         do {
@@ -747,7 +813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             recordingTempURL = tempURL
             recordingFormat = format
             recordButton.title = "■ Stop recording"
-            microphone.isEnabled = false; resolution.isEnabled = false; output.isEnabled = false
+            microphone.isEnabled = false; audioChannel.isEnabled = false; resolution.isEnabled = false; output.isEnabled = false
             status.stringValue = "Recording"
         } catch {
             showError("Could not start recording: \(error.localizedDescription)")
@@ -758,7 +824,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let controller else { return }
         recordButton.isEnabled = false; status.stringValue = "Finishing video…"
         let complete: (Result<Void, Error>) -> Void = { result in
-            self.recordButton.isEnabled = true; self.recordButton.title = "● Record"; self.microphone.isEnabled = !self.microphones.isEmpty; self.resolution.isEnabled = true; self.output.isEnabled = true
+            self.recordButton.isEnabled = true; self.recordButton.title = "● Record"; self.microphone.isEnabled = !self.microphones.isEmpty; self.audioChannel.isEnabled = (self.controller?.audioChannelCount ?? 0) > 1; self.resolution.isEnabled = true; self.output.isEnabled = true
             switch result {
             case .success:
                 guard let tempURL = self.recordingTempURL else { return }
